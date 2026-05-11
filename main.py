@@ -27,7 +27,9 @@ BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "public" / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-SPEAKER_REFERENCE = BASE_DIR / "voiceover.wav"
+SAMPLE_VOICE_DIR = BASE_DIR / "sample_voice"
+DEFAULT_SPEAKER_WAV = os.getenv("DEFAULT_SPEAKER_WAV", "VO_Escoffier.wav")
+LEGACY_SPEAKER_REFERENCE = BASE_DIR / "voiceover.wav"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 MP3_BITRATE = os.getenv("TTS_MP3_BITRATE", "48k")
 MP3_SAMPLE_RATE = os.getenv("TTS_MP3_SAMPLE_RATE", "24000")
@@ -43,23 +45,6 @@ def ffmpeg_exe() -> str:
     if path_ffmpeg:
         return path_ffmpeg
 
-    local_candidates = [
-        BASE_DIR / "ffmpeg.exe",
-        BASE_DIR / "ffmpeg" / "ffmpeg.exe",
-        BASE_DIR / "ffmpeg" / "bin" / "ffmpeg.exe",
-        BASE_DIR / "tools" / "ffmpeg" / "ffmpeg.exe",
-        BASE_DIR / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe",
-    ]
-
-    for candidate in local_candidates:
-        if candidate.exists():
-            return str(candidate)
-
-    raise RuntimeError(
-        "ffmpeg tidak ditemukan. Tambahkan ffmpeg ke PATH, set env FFMPEG_BIN, "
-        "atau taruh ffmpeg.exe di folder project/ffmpeg/bin."
-    )
-
 
 app = FastAPI()
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
@@ -68,6 +53,55 @@ app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 # SET DEVICE (GPU)
 # ================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+TTS_MODEL_NAME = os.getenv("TTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
+tts = None
+
+
+def get_tts() -> TTS:
+    global tts
+    if tts is None:
+        engine = TTS(TTS_MODEL_NAME)
+        if hasattr(engine, "to"):
+            engine = engine.to(device)
+        tts = engine
+    return tts
+
+
+def _available_voice_files() -> list[str]:
+    if not SAMPLE_VOICE_DIR.exists():
+        return []
+    return sorted([p.name for p in SAMPLE_VOICE_DIR.glob("*.wav") if p.is_file()])
+
+
+def resolve_speaker_wav(speaker_wav: str) -> Path:
+    speaker_wav = (speaker_wav or "default").strip()
+
+    if speaker_wav.lower() == "default":
+        candidates = [DEFAULT_SPEAKER_WAV]
+    else:
+        candidates = [speaker_wav]
+
+    for name in candidates:
+        safe_name = Path(name).name
+        if safe_name != name and speaker_wav.lower() != "default":
+            raise HTTPException(status_code=400, detail="speaker_wav harus nama file saja (tanpa path).")
+
+        if not Path(safe_name).suffix:
+            safe_name = f"{safe_name}.wav"
+
+        candidate_path = SAMPLE_VOICE_DIR / safe_name
+        if candidate_path.exists():
+            return candidate_path
+
+    if speaker_wav.lower() == "default" and LEGACY_SPEAKER_REFERENCE.exists():
+        return LEGACY_SPEAKER_REFERENCE
+
+    available = _available_voice_files()
+    detail = "File speaker_wav tidak ditemukan."
+    if available:
+        detail += f" Pilihan tersedia: {', '.join(available)}"
+    raise HTTPException(status_code=404, detail=detail)
 
 class TTSRequest(BaseModel):
     text: str
@@ -128,6 +162,8 @@ async def health():
         "device": device,
         "audio_format": "mp3",
         "audio_dir": str(AUDIO_DIR),
+        "voices_dir": str(SAMPLE_VOICE_DIR),
+        "available_voices": _available_voice_files(),
         "storage_policy": "keep_latest_audio_only",
     }
 
@@ -137,20 +173,16 @@ async def synthesize(request: Request, payload: TTSRequest):
     try:
         cleanup_audio_files(expired_only=True)
 
-        if not SPEAKER_REFERENCE.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="File referensi suara 'voiceover.wav' nggak ketemu!",
-            )
+        speaker_path = resolve_speaker_wav(payload.speaker_wav)
 
         audio_id = f"liz-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         wav_path = AUDIO_DIR / f"{audio_id}.wav"
         mp3_filename = f"{audio_id}.mp3"
         mp3_path = AUDIO_DIR / mp3_filename
 
-        tts.tts_to_file(
+        get_tts().tts_to_file(
             text=payload.text,
-            speaker_wav=str(SPEAKER_REFERENCE),
+            speaker_wav=str(speaker_path),
             language="en",
             file_path=str(wav_path),
         )
