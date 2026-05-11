@@ -33,6 +33,7 @@ LEGACY_SPEAKER_REFERENCE = BASE_DIR / "voiceover.wav"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 MP3_BITRATE = os.getenv("TTS_MP3_BITRATE", "48k")
 MP3_SAMPLE_RATE = os.getenv("TTS_MP3_SAMPLE_RATE", "24000")
+TTS_LEADING_SILENCE_MS = int(os.getenv("TTS_LEADING_SILENCE_MS", "250"))
 AUDIO_TTL_SECONDS = int(os.getenv("AUDIO_TTL_SECONDS", "900"))
 
 
@@ -140,6 +141,12 @@ def convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
         "error",
         "-i",
         str(wav_path),
+    ]
+
+    if TTS_LEADING_SILENCE_MS > 0:
+        cmd.extend(["-af", f"adelay={TTS_LEADING_SILENCE_MS}:all=1"])
+
+    cmd.extend([
         "-ar",
         MP3_SAMPLE_RATE,
         "-ac",
@@ -147,7 +154,7 @@ def convert_wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
         "-b:a",
         MP3_BITRATE,
         str(mp3_path),
-    ]
+    ])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -164,6 +171,7 @@ async def health():
         "audio_dir": str(AUDIO_DIR),
         "voices_dir": str(SAMPLE_VOICE_DIR),
         "available_voices": _available_voice_files(),
+        "leading_silence_ms": TTS_LEADING_SILENCE_MS,
         "storage_policy": "keep_latest_audio_only",
     }
 
