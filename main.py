@@ -36,7 +36,7 @@ LEGACY_SPEAKER_REFERENCE = BASE_DIR / "voiceover.wav"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 MP3_BITRATE = os.getenv("TTS_MP3_BITRATE", "48k")
 MP3_SAMPLE_RATE = os.getenv("TTS_MP3_SAMPLE_RATE", "24000")
-TTS_LEADING_SILENCE_MS = int(os.getenv("TTS_LEADING_SILENCE_MS", "900"))
+TTS_LEADING_SILENCE_MS = int(os.getenv("TTS_LEADING_SILENCE_MS", "2000"))
 AUDIO_TTL_SECONDS = int(os.getenv("AUDIO_TTL_SECONDS", "900"))
 
 TTS_ENGINE_NAME = os.getenv("TTS_ENGINE", "xtts").lower()
