@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from engines.base import StreamEngine
+from stt import transcribe_bytes
 
 # -----------------------------------------------------------------------------
 # Paths / env
@@ -198,7 +199,30 @@ async def health():
         "available_voices": _available_voice_files(),
         "leading_silence_ms": TTS_LEADING_SILENCE_MS,
         "storage_policy": "keep_latest_audio_only",
+        "stt_model": os.getenv("STT_MODEL", "base.en"),
     }
+
+
+@app.post("/transcribe")
+async def transcribe_endpoint(request: Request):
+    """Speech-to-text. Accepts a WAV body (audio/wav) and returns
+    {text, language, duration_ms}.
+
+    Used by the backend's upstream voice path — see plan.md §VAD/STT.
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body.")
+
+    language = request.query_params.get("language", "en")
+    if language.lower() in ("auto", ""):
+        language = None
+
+    try:
+        return transcribe_bytes(body, language=language)
+    except Exception as exc:
+        print(f"[STT] transcribe error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/synthesize")
