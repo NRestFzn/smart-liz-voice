@@ -20,25 +20,30 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 from engines.base import StreamEngine
-from stt import transcribe_bytes
+
+import io
+import speech_recognition as sr
 
 # -----------------------------------------------------------------------------
 # Paths / env
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 AUDIO_DIR = BASE_DIR / "public" / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 SAMPLE_VOICE_DIR = BASE_DIR / "sample_voice"
-DEFAULT_SPEAKER_WAV = os.getenv("DEFAULT_SPEAKER_WAV", "VO_Escoffier.wav")
+DEFAULT_SPEAKER_WAV = os.getenv("DEFAULT_SPEAKER_WAV", "VO_Nicole_01.wav")
 LEGACY_SPEAKER_REFERENCE = BASE_DIR / "voiceover.wav"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 MP3_BITRATE = os.getenv("TTS_MP3_BITRATE", "48k")
 MP3_SAMPLE_RATE = os.getenv("TTS_MP3_SAMPLE_RATE", "24000")
-TTS_LEADING_SILENCE_MS = int(os.getenv("TTS_LEADING_SILENCE_MS", "2000"))
+TTS_LEADING_SILENCE_MS = int(os.getenv("TTS_LEADING_SILENCE_MS", "0"))
 AUDIO_TTL_SECONDS = int(os.getenv("AUDIO_TTL_SECONDS", "900"))
+TTS_WARM_UP_ON_STARTUP = os.getenv("TTS_WARM_UP_ON_STARTUP", "1") == "1"
 
 TTS_ENGINE_NAME = os.getenv("TTS_ENGINE", "xtts").lower()
 
@@ -46,13 +51,24 @@ TTS_ENGINE_NAME = os.getenv("TTS_ENGINE", "xtts").lower()
 # Engine loader
 # -----------------------------------------------------------------------------
 def _load_engine() -> StreamEngine:
+    if TTS_ENGINE_NAME in {"system", "sapi", "windows"}:
+        from engines.system_engine import SystemTTSEngine
+        return SystemTTSEngine()
+
     if TTS_ENGINE_NAME == "chattts":
         from engines.chattts_engine import ChatTTSEngine
         return ChatTTSEngine()
 
-    # Default / fallback
-    from engines.xtts_engine import XTTSEngine
-    return XTTSEngine()
+    try:
+        from engines.xtts_engine import XTTSEngine
+        return XTTSEngine()
+    except Exception as exc:
+        if os.getenv("TTS_ALLOW_SYSTEM_FALLBACK", "1") != "1":
+            raise
+
+        print(f"[TTS] XTTS unavailable, falling back to Windows System.Speech: {exc}")
+        from engines.system_engine import SystemTTSEngine
+        return SystemTTSEngine()
 
 
 engine: StreamEngine | None = None
@@ -80,6 +96,7 @@ def ffmpeg_exe() -> str:
     path_ffmpeg = shutil.which("ffmpeg")
     if path_ffmpeg:
         return path_ffmpeg
+    return "ffmpeg"
 
 
 def _available_voice_files() -> list[str]:
@@ -188,11 +205,12 @@ def stream_pcm_chunks(text: str, speaker_path: Path, emotion: str) -> Iterator[b
 # -----------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    eng = get_engine()
+    active_engine = get_engine()
     return {
         "ok": True,
-        "engine": TTS_ENGINE_NAME,
-        "sample_rate": eng.sample_rate,
+        "configured_engine": TTS_ENGINE_NAME,
+        "active_engine": active_engine.__class__.__name__,
+        "sample_rate": active_engine.sample_rate,
         "audio_format": "mp3",
         "audio_dir": str(AUDIO_DIR),
         "voices_dir": str(SAMPLE_VOICE_DIR),
@@ -205,43 +223,54 @@ async def health():
 
 @app.post("/transcribe")
 async def transcribe_endpoint(request: Request):
-    """Speech-to-text. Accepts a WAV body (audio/wav) and returns
-    {text, language, duration_ms}.
-
-    Used by the backend's upstream voice path — see plan.md §VAD/STT.
+    """
+    Speech-to-text pake Google API.
+    Menerima WAV dari Express/ESP32, ngembaliin {text, language}.
     """
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Empty request body.")
 
-    language = request.query_params.get("language", "en")
-    if language.lower() in ("auto", ""):
-        language = None
-
     try:
-        return transcribe_bytes(body, language=language)
+        # Bungkus raw bytes dari req.body jadi file-like object 
+        # biar bisa dibaca sama library speech_recognition
+        wav_io = io.BytesIO(body)
+        recognizer = sr.Recognizer()
+
+        # Load audio dari memory (wav_io)
+        with sr.AudioFile(wav_io) as source:
+            audio_content = recognizer.record(source)
+
+        # Tembak ke Google API persis kayak script test lu kemarin
+        # Set language id-ID biar paten bahasa Indonesia
+        hasil_teks = recognizer.recognize_google(audio_content, language="id-ID")
+        
+        print(f"[STT] Berhasil nangkep: {hasil_teks}")
+        
+        # Return JSON sesuai ekspektasi ESP32 lu
+        return {
+            "text": hasil_teks,
+            "language": "id"
+        }
+
+    except sr.UnknownValueError:
+        print("[STT] Google API gak bisa nangkep suaranya (noise / gak jelas)")
+        # Return text kosong biar ESP32 nggak error parsing
+        return {"text": "", "language": "id"}
+        
+    except sr.RequestError as exc:
+        print(f"[STT] Gagal request ke Google API: {exc}")
+        raise HTTPException(status_code=502, detail="Google API Error")
+        
     except Exception as exc:
-        print(f"[STT] transcribe error: {exc}")
+        print(f"[STT] Internal error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/synthesize")
 async def synthesize(request: Request, payload: TTSRequest):
-    """Legacy batch endpoint — generates a full WAV via XTTS, converts to MP3.
-
-    Only the XTTS engine implements the batch shim. When TTS_ENGINE=chattts,
-    this endpoint returns 503 so callers know to switch to /synthesize_stream.
-    """
+    """Batch endpoint that generates a full WAV, then converts it to MP3."""
     try:
-        if TTS_ENGINE_NAME != "xtts":
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Legacy /synthesize endpoint is only available with "
-                    "TTS_ENGINE=xtts. Use /synthesize_stream instead."
-                ),
-            )
-
         cleanup_audio_files(expired_only=True)
 
         speaker_path = resolve_speaker_wav(payload.speaker_wav)
@@ -251,9 +280,14 @@ async def synthesize(request: Request, payload: TTSRequest):
         mp3_filename = f"{audio_id}.mp3"
         mp3_path = AUDIO_DIR / mp3_filename
 
-        xtts = get_engine()
-        # Cast for the legacy method — only XTTSEngine implements tts_to_file.
-        xtts.tts_to_file(  # type: ignore[attr-defined]
+        engine = get_engine()
+        if not hasattr(engine, "tts_to_file"):
+            raise HTTPException(
+                status_code=503,
+                detail="The selected TTS engine does not support batch /synthesize.",
+            )
+
+        engine.tts_to_file(  # type: ignore[attr-defined]
             text=payload.text,
             speaker_wav=str(speaker_path),
             file_path=str(wav_path),
@@ -351,11 +385,16 @@ async def synthesize_wav_stream(payload: TTSRequest):
 
 @app.on_event("startup")
 def warm_up_default_speaker():
+    if not TTS_WARM_UP_ON_STARTUP:
+        print("[TTS] startup warm-up disabled; set TTS_WARM_UP_ON_STARTUP=1 to enable")
+        return
+
     try:
         speaker_path = resolve_speaker_wav("default")
-        get_engine().warm_up(speaker_path)
+        active_engine = get_engine()
+        active_engine.warm_up(speaker_path)
         print(
-            f"[TTS] engine={TTS_ENGINE_NAME} ready — warm-up complete for {speaker_path.name}"
+            f"[TTS] configured_engine={TTS_ENGINE_NAME} active_engine={active_engine.__class__.__name__} ready - warm-up complete for {speaker_path.name}"
         )
     except Exception as exc:
         print(f"[TTS] Warm-up skipped: {exc}")
@@ -364,4 +403,4 @@ def warm_up_default_speaker():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

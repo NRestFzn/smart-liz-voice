@@ -8,10 +8,12 @@ tensors converted to PCM16-LE.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import soundfile as sf
 import torch
 from TTS.api import TTS
 
@@ -39,6 +41,57 @@ def _tensor_chunk_to_pcm16(chunk) -> bytes:
     return (samples * 32767.0).astype("<i2").tobytes()
 
 
+def _split_for_batch_tts(text: str, max_chars: int) -> list[str]:
+    sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", text) if s.strip()]
+    sentence_chunks: list[str] = []
+
+    for sentence in sentences or [text.strip()]:
+        if len(sentence) <= max_chars:
+            sentence_chunks.append(sentence)
+            continue
+
+        words = sentence.split()
+        current: list[str] = []
+        for word in words:
+            candidate = " ".join([*current, word])
+            if current and len(candidate) > max_chars:
+                sentence_chunks.append(" ".join(current).rstrip(",;:") + ".")
+                current = [word]
+            else:
+                current.append(word)
+        if current:
+            sentence_chunks.append(" ".join(current))
+
+    packed: list[str] = []
+    current = ""
+    for chunk in sentence_chunks:
+        candidate = f"{current} {chunk}".strip()
+        if current and len(candidate) > max_chars:
+            packed.append(current)
+            current = chunk
+        else:
+            current = candidate
+    if current:
+        packed.append(current)
+
+    return packed
+
+
+def _reference_audio_paths(speaker_path: Path) -> list[Path]:
+    env_paths = os.getenv("TTS_REFERENCE_WAVS")
+    if env_paths:
+        refs = [Path(value.strip()) for value in env_paths.split(";") if value.strip()]
+        return [path for path in refs if path.exists()]
+
+    prefix = re.sub(r"_\d+$", "", speaker_path.stem)
+    if prefix != speaker_path.stem:
+        refs = sorted(speaker_path.parent.glob(f"{prefix}*.wav"))
+        if refs:
+            return refs
+
+    return [speaker_path]
+
+
 class XTTSEngine:
     """XTTS v2 wrapper implementing the StreamEngine protocol."""
 
@@ -59,13 +112,25 @@ class XTTSEngine:
 
         self._stream_chunk_size = int(os.getenv("TTS_STREAM_CHUNK_SIZE", "20"))
         self._stream_overlap_len = int(os.getenv("TTS_STREAM_OVERLAP_LEN", "1024"))
+        self._batch_speed = float(os.getenv("TTS_BATCH_SPEED", "1.0"))
+        self._batch_max_chars = int(os.getenv("TTS_BATCH_MAX_CHARS", "120"))
+        self._batch_pause_ms = int(os.getenv("TTS_BATCH_PAUSE_MS", "500"))
+        self._temperature = float(os.getenv("TTS_TEMPERATURE", "0.78"))
+        self._top_p = float(os.getenv("TTS_TOP_P", "0.88"))
+        self._top_k = int(os.getenv("TTS_TOP_K", "50"))
+        self._repetition_penalty = float(os.getenv("TTS_REPETITION_PENALTY", "8.0"))
+        self._gpt_cond_len = int(os.getenv("TTS_GPT_COND_LEN", "12"))
+        self._gpt_cond_chunk_len = int(os.getenv("TTS_GPT_COND_CHUNK_LEN", "6"))
+        self._max_ref_len = int(os.getenv("TTS_MAX_REF_LEN", "15"))
+        self._sound_norm_refs = os.getenv("TTS_SOUND_NORM_REFS", "0") == "1"
         self._speaker_cache: dict[str, tuple] = {}
 
     # -- StreamEngine protocol -------------------------------------------------
 
     def warm_up(self, speaker_path: Path) -> None:
         self._get_speaker_conditioning(speaker_path)
-        print(f"[XTTS] precomputed conditioning for {speaker_path.name}")
+        refs = _reference_audio_paths(speaker_path)
+        print(f"[XTTS] precomputed conditioning for {', '.join(path.name for path in refs)}")
 
     def stream(
         self,
@@ -93,14 +158,19 @@ class XTTSEngine:
     # -- Internal --------------------------------------------------------------
 
     def _get_speaker_conditioning(self, speaker_path: Path):
-        cache_key = str(speaker_path)
+        refs = _reference_audio_paths(speaker_path)
+        cache_key = "|".join(str(path) for path in refs)
         cached = self._speaker_cache.get(cache_key)
         if cached is not None:
             return cached
 
         gpt_cond_latent, speaker_embedding = (
             self.tts.synthesizer.tts_model.get_conditioning_latents(
-                audio_path=[str(speaker_path)]
+                audio_path=[str(path) for path in refs],
+                gpt_cond_len=self._gpt_cond_len,
+                gpt_cond_chunk_len=self._gpt_cond_chunk_len,
+                max_ref_length=self._max_ref_len,
+                sound_norm_refs=self._sound_norm_refs,
             )
         )
         self._speaker_cache[cache_key] = (gpt_cond_latent, speaker_embedding)
@@ -109,10 +179,29 @@ class XTTSEngine:
     # -- Legacy batch path (used by /synthesize) -------------------------------
 
     def tts_to_file(self, text: str, speaker_wav: str, file_path: str) -> None:
-        """Backwards-compat shim for the legacy MP3 endpoint in `main.py`."""
-        self.tts.tts_to_file(
-            text=text,
-            speaker_wav=speaker_wav,
-            language="en",
-            file_path=file_path,
-        )
+        """Batch synthesis using cached speaker conditioning."""
+        speaker_path = Path(speaker_wav)
+        gpt_cond_latent, speaker_embedding = self._get_speaker_conditioning(speaker_path)
+
+        chunks = _split_for_batch_tts(text, self._batch_max_chars)
+        pause = np.zeros(int(self.sample_rate * self._batch_pause_ms / 1000), dtype=np.float32)
+        wav_parts: list[np.ndarray] = []
+
+        for index, chunk in enumerate(chunks):
+            result = self.tts.synthesizer.tts_model.inference(
+                text=chunk,
+                language="en",
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                speed=self._batch_speed,
+                temperature=self._temperature,
+                top_p=self._top_p,
+                top_k=self._top_k,
+                repetition_penalty=self._repetition_penalty,
+            )
+            wav_parts.append(np.asarray(result["wav"], dtype=np.float32))
+            if index < len(chunks) - 1 and self._batch_pause_ms > 0:
+                wav_parts.append(pause)
+
+        wav = np.concatenate(wav_parts) if wav_parts else np.zeros(0, dtype=np.float32)
+        sf.write(file_path, wav, self.sample_rate)

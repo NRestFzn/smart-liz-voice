@@ -2,3 +2,16 @@ faster-whisper>=1.1.0
 numpy>=1.26.0
 pyserial>=3.5
 sounddevice>=0.4.6
+SpeechRecognition>=3.10.0
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0+cu130
+torchaudio==2.11.0+cu130
+
+# Coqui XTTS v2 (used by engines/xtts_engine.py)
+TTS==0.22.0
+networkx==2.8.8
+
+# Coqui TTS 0.22 imports BeamSearchScorer from the transformers top-level.
+# Newer Transformers releases (including some late 4.x and all 5.x) no longer
+# export it there, causing XTTS to crash at import-time.
+transformers>=4.33.0,<4.41
